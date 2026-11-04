@@ -1,0 +1,666 @@
+//! HTTP client, request building and probing a URL.
+
+use crate::filename;
+use crate::limiter::SpeedLimiter;
+use crate::model::{DownloadKind, ProbeResult, RequestHeaders};
+use anyhow::{bail, Context};
+use reqwest::header::{
+    ACCEPT, ACCEPT_ENCODING, CONTENT_DISPOSITION, CONTENT_RANGE, CONTENT_TYPE,
+    COOKIE, RANGE, REFERER, USER_AGENT,
+};
+use reqwest::{Client, RequestBuilder, StatusCode};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+/// Live counters of a running download, read by the UI.
+#[derive(Default)]
+pub struct Progress {
+    pub bytes: AtomicU64,
+    pub connections: AtomicU32,
+    /// torrents: how many of the connected people have the whole file
+    pub seeders: AtomicU32,
+    pub parts_total: AtomicU32,
+    pub parts_done: AtomicU32,
+    pub assembling: AtomicBool,
+    /// the connection dropped: waiting for the internet to come back
+    pub waiting: AtomicBool,
+    /// woken when data flows again, so every waiting part retries at once
+    pub back_online: tokio::sync::Notify,
+    /// connections the user wants now (0 = as many as the download began
+    /// with): changed while it runs, it gets more / fewer at once
+    pub want_connections: AtomicU32,
+    /// after the data: what it does (Step code, 0 = nothing) and how far (per mille)
+    pub step: std::sync::atomic::AtomicU8,
+    pub step_done: AtomicU32,
+}
+
+impl Progress {
+    /// Now doing `step` (None: nothing more).
+    pub fn set_step(&self, step: Option<crate::model::Step>) {
+        self.step.store(step.map(|s| s.code()).unwrap_or(0), Ordering::Relaxed);
+        self.step_done.store(0, Ordering::Relaxed);
+    }
+    /// How far the step is (0..1).
+    pub fn step_at(&self, f: f64) {
+        self.step_done.store((f.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
+    }
+
+    /// Data arrived: the connection works (again).
+    pub fn online(&self) {
+        if self.waiting.swap(false, Ordering::Relaxed) {
+            self.back_online.notify_waiters();
+        }
+    }
+}
+
+/// The connection broke while receiving (stall, early close).
+#[derive(Debug)]
+pub struct NetDrop(pub &'static str);
+impl std::fmt::Display for NetDrop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for NetDrop {}
+
+/// The server answered with an error status.
+#[derive(Debug)]
+pub struct HttpStatus(pub u16);
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server answered HTTP {}", self.0)
+    }
+}
+impl std::error::Error for HttpStatus {}
+
+/// A problem of the connection (no internet, DNS, reset, timeout), not of
+/// the file or the link: worth waiting for and trying again without limit.
+pub fn is_network_error(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind as K;
+    e.chain().any(|c| {
+        if c.is::<NetDrop>() {
+            return true;
+        }
+        if let Some(r) = c.downcast_ref::<reqwest::Error>() {
+            return r.status().is_none() && !r.is_builder() && !r.is_redirect()
+                && (r.is_connect() || r.is_timeout() || r.is_request() || r.is_body() || r.is_decode());
+        }
+        if let Some(io) = c.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                K::ConnectionReset | K::ConnectionAborted | K::ConnectionRefused | K::NotConnected
+                    | K::TimedOut | K::BrokenPipe | K::UnexpectedEof | K::HostUnreachable
+                    | K::NetworkUnreachable | K::NetworkDown
+            );
+        }
+        false
+    })
+}
+
+/// The server's status code, if the error is one.
+pub fn http_status_of(e: &anyhow::Error) -> Option<u16> {
+    e.chain().find_map(|c| c.downcast_ref::<HttpStatus>().map(|s| s.0))
+}
+
+/// How long to wait before trying again after `n` failures in a row while
+/// the connection is down: quick at first, then every 10 seconds.
+pub fn reconnect_delay(n: u32) -> Duration {
+    Duration::from_secs(match n {
+        0 | 1 => 2,
+        2 => 3,
+        3 => 5,
+        4 => 8,
+        _ => 10,
+    })
+}
+
+/// A failure of the server or the transfer (busy server, "HTTP 503", a
+/// connection that broke off early) that may well go away by itself: the
+/// download tries again later on its own. Not: a link that expired or a
+/// file that was removed (401/403/404/410), a login, a full disk.
+pub fn is_passing_error(e: &anyhow::Error) -> bool {
+    if is_network_error(e) {
+        return true;
+    }
+    if let Some(s) = http_status_of(e) {
+        return s == 408 || s == 425 || s == 429 || (500..600).contains(&s);
+    }
+    let text = format!("{e:#}").to_ascii_lowercase();
+    let lasting = [
+        "expired", "removed", "login", "age check", "not enough", "no room", "disk", "space",
+        "access is denied", "permission", "bitlocker", "not found", "did not accept the byte range",
+        "web page", "missing", "cannot", "can't", "invalid",
+    ];
+    if lasting.iter().any(|w| text.contains(w)) {
+        return false;
+    }
+    ["closed early", "ended before", "timed out", "reset", "broken pipe", "unexpected eof", "connection"]
+        .iter()
+        .any(|w| text.contains(w))
+}
+
+/// The server stopped taking the link (401 / 403 / 410, an expired link):
+/// a new link is fetched the way the first one was (the address the
+/// download came from, or the video's page), checked, and the download goes
+/// on with it from where it was.
+pub fn is_link_gone(e: &anyhow::Error) -> bool {
+    if matches!(http_status_of(e), Some(401 | 403 | 410)) {
+        return true;
+    }
+    let text = format!("{e:#}").to_ascii_lowercase();
+    text.contains("link has expired") || text.contains("not the same file")
+}
+
+/// How long to wait before the next try to get a working link: 3 s, 10 s,
+/// 30 s, 1 min, 2 min, 5 min.
+pub fn relink_delay(n: u32) -> Duration {
+    Duration::from_secs(match n {
+        0 | 1 => 3,
+        2 => 10,
+        3 => 30,
+        4 => 60,
+        5 => 120,
+        _ => 300,
+    })
+}
+
+/// How long to wait before the next try after a passing failure:
+/// 15 s, 30 s, 1 min, 2 min, 5 min, then every 10 minutes.
+pub fn retry_delay(n: u32) -> Duration {
+    Duration::from_secs(match n {
+        0 | 1 => 15,
+        2 => 30,
+        3 => 60,
+        4 => 120,
+        5 => 300,
+        _ => 600,
+    })
+}
+
+/// Counts an open connection for as long as it lives.
+pub struct ConnGuard(Arc<Progress>);
+impl ConnGuard {
+    pub fn new(p: &Arc<Progress>) -> Self {
+        p.connections.fetch_add(1, Ordering::Relaxed);
+        ConnGuard(p.clone())
+    }
+}
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Things every transfer needs.
+pub struct Shared {
+    /// replaced when the proxy settings change
+    client: RwLock<Client>,
+    pub limiter: SpeedLimiter,
+}
+
+impl Shared {
+    pub fn new(client: Client, limiter: SpeedLimiter) -> Shared {
+        Shared { client: RwLock::new(client), limiter }
+    }
+    /// The HTTP client (cheap to clone: it is shared inside).
+    pub fn client(&self) -> Client {
+        self.client.read().unwrap().clone()
+    }
+    pub fn set_client(&self, c: Client) {
+        *self.client.write().unwrap() = c;
+    }
+}
+
+/// Proxy part of the settings (Options > Proxy / Socks).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ProxyConfig {
+    /// 0 none, 1 system, 2 manual
+    pub mode: u32,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    pub bypass: String,
+}
+
+impl ProxyConfig {
+    pub fn from_settings(s: &crate::config::Settings) -> ProxyConfig {
+        ProxyConfig {
+            mode: s.proxy_mode,
+            host: s.proxy_host.trim().to_string(),
+            port: s.proxy_port,
+            user: s.proxy_user.clone(),
+            password: s.proxy_password.clone(),
+            bypass: s.proxy_bypass.clone(),
+        }
+    }
+}
+
+/// How long a server may take to answer a request (or to send the next
+/// piece of data) before the request is given up and made again.
+pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub fn build_client() -> anyhow::Result<Client> {
+    build_client_with(&ProxyConfig { mode: 1, ..Default::default() })
+}
+
+pub fn build_client_with(proxy: &ProxyConfig) -> anyhow::Result<Client> {
+    let mut b = Client::builder()
+        // Real separate TCP connections. With HTTP/2 all our
+        // "connections" would share one TCP connection and be as slow as one.
+        .http1_only()
+        // "User-Agent:", not "user-agent:": the names written the way browsers
+        // and other download programs write them. Cloudflare's protection
+        // refuses lowercase names (HTTP 403, "challenge") even with the
+        // browser's own cookies and name (samfw.com and many more)
+        .http1_title_case_headers()
+        .tcp_nodelay(true)
+        .connect_timeout(Duration::from_secs(20))
+        // a server that takes the connection and then says nothing (no
+        // answer, or the data stops): the request ends instead of waiting
+        // for ever, and the download tries again by itself
+        .read_timeout(ANSWER_TIMEOUT)
+        .pool_max_idle_per_host(64)
+        // redirects are followed by `SendOrdered::send_ordered`, which puts
+        // "Host" first again on every step (see there)
+        .redirect(reqwest::redirect::Policy::none());
+    match proxy.mode {
+        // 1 = system settings: reqwest reads them by itself
+        0 => b = b.no_proxy(),
+        2 if !proxy.host.is_empty() => {
+            let host = proxy.host.trim_start_matches("http://").trim_start_matches("https://");
+            let url = format!("http://{host}:{}", proxy.port);
+            let mut p = reqwest::Proxy::all(&url).context("the proxy address is not valid")?;
+            if !proxy.user.is_empty() {
+                p = p.basic_auth(&proxy.user, &proxy.password);
+            }
+            let bypass = proxy.bypass.split_whitespace().collect::<Vec<_>>().join(",");
+            p = p.no_proxy(reqwest::NoProxy::from_string(&bypass));
+            b = b.proxy(p);
+        }
+        _ => {}
+    }
+    Ok(b.build()?)
+}
+
+/// How many redirects one request follows.
+const MAX_REDIRECTS: usize = 15;
+
+/// Sending a request the way browsers and other download programs send it:
+/// "Host" is the first line after the request line. The library puts it
+/// last, and Cloudflare's protection refuses such a request (HTTP 403,
+/// "challenge"), whatever else it carries (samfw.com and many more). The
+/// client follows no redirects by itself, so every step of a redirect is
+/// sent here too, with the "Host" of its own address.
+pub trait SendOrdered {
+    fn send_ordered(self) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send;
+}
+
+impl SendOrdered for RequestBuilder {
+    async fn send_ordered(self) -> reqwest::Result<reqwest::Response> {
+        let (client, req) = self.build_split();
+        let mut req = req?;
+        let mut steps = 0;
+        loop {
+            host_first(&mut req);
+            let again = req.try_clone();
+            let resp = client.execute(req).await?;
+            let status = resp.status();
+            if !status.is_redirection() || steps >= MAX_REDIRECTS {
+                return Ok(resp);
+            }
+            let next = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|l| resp.url().join(l.trim()).ok())
+                .filter(|u| matches!(u.scheme(), "http" | "https"));
+            let (Some(next), Some(mut n)) = (next, again) else { return Ok(resp) };
+            // 303, and 301 / 302 after a POST: the next step is a plain GET
+            if status == StatusCode::SEE_OTHER
+                || (matches!(status, StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND) && n.method() == reqwest::Method::POST)
+            {
+                *n.method_mut() = reqwest::Method::GET;
+                *n.body_mut() = None;
+                n.headers_mut().remove(CONTENT_TYPE);
+                n.headers_mut().remove(reqwest::header::CONTENT_LENGTH);
+            }
+            // another site never gets this site's sign-in
+            let prev = resp.url();
+            if next.host_str() != prev.host_str() || next.port_or_known_default() != prev.port_or_known_default() {
+                for h in [reqwest::header::AUTHORIZATION, COOKIE, reqwest::header::PROXY_AUTHORIZATION, reqwest::header::WWW_AUTHENTICATE] {
+                    n.headers_mut().remove(h);
+                }
+            }
+            *n.url_mut() = next;
+            req = n;
+            steps += 1;
+        }
+    }
+}
+
+/// "Host" (with the port when it is not the usual one) as the first header.
+fn host_first(req: &mut reqwest::Request) {
+    let url = req.url();
+    let Some(host) = url.host_str() else { return };
+    let value = match url.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    };
+    let Ok(value) = reqwest::header::HeaderValue::from_str(&value) else { return };
+    let old = std::mem::take(req.headers_mut());
+    let mut h = reqwest::header::HeaderMap::with_capacity(old.len() + 1);
+    h.insert(reqwest::header::HOST, value);
+    for (k, v) in old.iter() {
+        if k != reqwest::header::HOST {
+            h.append(k.clone(), v.clone());
+        }
+    }
+    *req.headers_mut() = h;
+}
+
+/// GET request carrying the browser's headers.
+pub fn request(client: &Client, url: &str, h: &RequestHeaders, default_ua: &str) -> RequestBuilder {
+    let ua = h
+        .user_agent
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_ua);
+    // identity: ranges must refer to the raw bytes, never a compressed body
+    let mut rb = client
+        .get(url)
+        .header(USER_AGENT, ua)
+        .header(ACCEPT, "*/*")
+        .header(ACCEPT_ENCODING, "identity");
+    if let Some(r) = h.referer.as_deref().filter(|s| !s.is_empty()) {
+        rb = rb.header(REFERER, r);
+    }
+    if let Some(c) = h.cookies.as_deref().filter(|s| !s.is_empty()) {
+        rb = rb.header(COOKIE, c);
+    }
+    for (k, v) in &h.extra {
+        rb = rb.header(k.as_str(), v.as_str());
+    }
+    if let Some((user, pass)) = h.auth.as_ref().filter(|(u, _)| !u.is_empty()) {
+        rb = rb.basic_auth(user, Some(pass));
+    }
+    rb
+}
+
+fn looks_like_hls(url: &str, content_type: Option<&str>) -> bool {
+    let ct = content_type.unwrap_or("").to_ascii_lowercase();
+    if ct.contains("mpegurl") {
+        return true;
+    }
+    url::Url::parse(url)
+        .map(|u| u.path().to_ascii_lowercase().ends_with(".m3u8"))
+        .unwrap_or(false)
+}
+
+/// Ways to ask again when a server refuses the request as the browser sent
+/// it: some sites refuse a byte range, or cookies / a referrer that belong to
+/// the browser's own session. (with range?, headers)
+fn fallbacks(h: &RequestHeaders) -> Vec<(bool, RequestHeaders)> {
+    let mut out = vec![(true, h.clone()), (false, h.clone())];
+    let has = |s: &Option<String>| s.as_deref().map(|v| !v.is_empty()).unwrap_or(false);
+    if has(&h.cookies) {
+        let mut n = h.clone();
+        n.cookies = None;
+        out.push((true, n.clone()));
+        out.push((false, n));
+    }
+    if has(&h.cookies) || has(&h.referer) || has(&h.user_agent) {
+        let mut n = h.clone();
+        n.cookies = None;
+        n.referer = None;
+        n.user_agent = None;
+        out.push((true, n.clone()));
+        out.push((false, n));
+    }
+    out
+}
+
+/// Ask the server about a file: real size, final URL after redirects,
+/// file name and whether it supports ranges (= resume + many connections).
+pub async fn probe(
+    client: &Client,
+    url: &str,
+    headers: &RequestHeaders,
+    default_ua: &str,
+) -> anyhow::Result<ProbeResult> {
+    let mut first_refusal: Option<u16> = None;
+    let mut found = None;
+    for (with_range, h) in fallbacks(headers) {
+        let mut rb = request(client, url, &h, default_ua);
+        if with_range {
+            // from the start to the end, like a browser asking to resume:
+            // some servers refuse a tiny range ("bytes=0-0") but take this.
+            // Only the answer's headers are read, then the connection goes.
+            rb = rb.header(RANGE, "bytes=0-");
+        }
+        let resp = match tokio::time::timeout(ANSWER_TIMEOUT, rb.send_ordered()).await {
+            Ok(r) => r.context("could not connect to server")?,
+            Err(_) => return Err(NetDrop("the server did not answer (timed out)").into()),
+        };
+        let status = resp.status();
+        if status == StatusCode::UNAUTHORIZED {
+            bail!("the server asks for a user name and password (HTTP 401) - use \"Use authorization\" or Options > Site Logins");
+        }
+        // refused (forbidden, range not allowed, too many requests...): try
+        // the next way; anything else is the server's real answer
+        if matches!(status.as_u16(), 403 | 406 | 416 | 429) {
+            first_refusal.get_or_insert(status.as_u16());
+            continue;
+        }
+        if !status.is_success() {
+            bail!("server answered HTTP {}", status.as_u16());
+        }
+        let changed = h != *headers;
+        found = Some((resp, with_range, changed.then_some(h)));
+        break;
+    }
+    let Some((resp, with_range, headers_used)) = found else {
+        bail!("server answered HTTP {}", first_refusal.unwrap_or(403));
+    };
+    let status = resp.status();
+    let final_url = resp.url().to_string();
+    let h = resp.headers();
+    let content_type = h
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let last_modified = h
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| chrono::DateTime::parse_from_rfc2822(s.trim()).ok())
+        .map(|d| d.with_timezone(&chrono::Utc));
+    // a strong ETag only ("W/..." may stay the same for another file)
+    let etag = h
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.starts_with("W/"));
+
+    let (total_size, resumable) = if status == StatusCode::PARTIAL_CONTENT {
+        // "bytes 0-123455/123456"
+        let total = h
+            .get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.rsplit('/').next())
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        (total, total.is_some())
+    } else {
+        // the whole file came, not a part: whatever "Accept-Ranges" says,
+        // this server did not take a byte range, so one connection and no
+        // resume (parts it would not honour were made again and again)
+        (resp.content_length(), false)
+    };
+
+    let name = h
+        .get(CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(filename::from_content_disposition)
+        .or_else(|| filename::from_url(&final_url))
+        .or_else(|| filename::from_url(url))
+        .unwrap_or_else(|| "download".into());
+    let kind = if looks_like_hls(&final_url, content_type.as_deref()) {
+        DownloadKind::Hls
+    } else {
+        DownloadKind::Http
+    };
+    let mut file_name = filename::sanitize(&name);
+    if kind == DownloadKind::Hls {
+        // the stream gets joined into one .ts video file
+        let (stem, ext) = filename::split_ext(&file_name);
+        if ext.eq_ignore_ascii_case("m3u8") || ext.is_empty() {
+            file_name = format!("{stem}.ts");
+        }
+    } else {
+        file_name = filename::ensure_extension(file_name, content_type.as_deref());
+    }
+    drop(resp);
+
+    // a server that refused a byte range gets one plain connection
+    let resumable = resumable && with_range;
+    Ok(ProbeResult {
+        headers_used,
+        final_url,
+        file_name,
+        total_size: if kind == DownloadKind::Hls { None } else { total_size },
+        resumable: kind == DownloadKind::Http && resumable,
+        content_type,
+        kind,
+        last_modified,
+        etag,
+    })
+}
+
+#[cfg(test)]
+mod refused_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server that answers 403 to the browser's cookie and to byte ranges.
+    async fn picky_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                    let refused = req.contains("\r\ncookie:") || req.contains("\r\nrange:");
+                    let resp = if refused {
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\nhello".to_string()
+                    };
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/tool.bin")
+    }
+
+    #[tokio::test]
+    async fn probe_falls_back_when_refused() {
+        let url = picky_server().await;
+        let client = Client::builder().no_proxy().build().unwrap();
+        let headers = RequestHeaders { cookies: Some("cf=1".into()), ..Default::default() };
+        let p = probe(&client, &url, &headers, "UA").await.unwrap();
+        assert_eq!(p.total_size, Some(5));
+        assert!(!p.resumable, "the server refuses ranges: one plain connection");
+        let used = p.headers_used.expect("it worked only without the cookie");
+        assert!(used.cookies.is_none());
+    }
+
+    /// A server like Cloudflare's protection: lowercase header names are a
+    /// program, not a browser, and get HTTP 403.
+    #[tokio::test]
+    async fn header_names_are_written_like_a_browser() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let browser_like = ["User-Agent: ", "Accept: ", "Range: ", "Referer: ", "Cookie: "].iter().all(|h| req.contains(h))
+                        && !req.contains("user-agent:")
+                        && req.lines().nth(1).is_some_and(|l| l.starts_with("Host: 127.0.0.1:"));
+                    let resp = if browser_like {
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 0-4/5\r\nConnection: close\r\n\r\nhello"
+                    } else {
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let client = build_client_with(&ProxyConfig { mode: 0, ..Default::default() }).unwrap();
+        let headers = RequestHeaders { cookies: Some("a=1".into()), referer: Some("https://example.com/".into()), ..Default::default() };
+        let p = probe(&client, &format!("http://{addr}/f.zip"), &headers, "Mozilla/5.0 test").await.unwrap();
+        assert_eq!(p.total_size, Some(5));
+        assert!(p.headers_used.is_none(), "the first, full request was taken");
+    }
+
+    /// A redirect to another site: "Host" first and right on every step,
+    /// and the first site's cookie stays with the first site.
+    #[tokio::test]
+    async fn redirects_to_another_site_keep_host_first() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port2 = second.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = second.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let ok = req.lines().nth(1) == Some(&format!("Host: localhost:{port2}")) && !req.contains("Cookie:");
+                let resp = if ok {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_string()
+                } else {
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                };
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = first.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = first.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = s.read(&mut buf).await;
+                let resp = format!("HTTP/1.1 302 Found\r\nLocation: http://localhost:{port2}/real.zip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+        let client = build_client_with(&ProxyConfig { mode: 0, ..Default::default() }).unwrap();
+        let headers = RequestHeaders { cookies: Some("only=first".into()), ..Default::default() };
+        let p = probe(&client, &format!("http://{addr}/go"), &headers, "Mozilla/5.0 test").await.unwrap();
+        assert_eq!(p.total_size, Some(5));
+        assert!(p.final_url.ends_with("/real.zip"));
+    }
+}
+
+#[cfg(test)]
+mod passing_tests {
+    use super::*;
+    #[test]
+    fn which_failures_pass() {
+        assert!(is_passing_error(&anyhow::Error::new(HttpStatus(503))));
+        assert!(is_passing_error(&anyhow::Error::new(HttpStatus(429))));
+        assert!(!is_passing_error(&anyhow::Error::new(HttpStatus(404))));
+        assert!(!is_passing_error(&anyhow::Error::new(HttpStatus(403))));
+        assert!(is_passing_error(&anyhow::anyhow!("download ended before all parts were received")));
+        assert!(!is_passing_error(&anyhow::anyhow!("not enough room on the disk")));
+        assert!(!is_passing_error(&anyhow::Error::new(HttpStatus(410)).context("the link has expired or the file was removed")));
+        assert_eq!(retry_delay(1).as_secs(), 15);
+        assert_eq!(retry_delay(20).as_secs(), 600);
+    }
+}
